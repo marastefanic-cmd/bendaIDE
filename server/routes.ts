@@ -1,0 +1,184 @@
+import { Router, type Request, type Response, type NextFunction } from 'express';
+import multer from 'multer';
+import fs from 'node:fs';
+import path from 'node:path';
+import {
+  fileKey, MODELS, type ContextSelection, type HealthInfo, type Scope, type ServerEvent, type SessionKind,
+} from '../shared/types.js';
+import { agents } from './agent.js';
+import { auth } from './auth.js';
+import { buildContext } from './context.js';
+import { APP_DIR, HttpError, WORKSPACE_DIR } from './paths.js';
+import * as store from './store.js';
+
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 200 * 1024 * 1024 } });
+export const api = Router();
+
+/** Express 5 types params as string | string[]; our routes only use simple segments. */
+type Req = Request<Record<string, string>>;
+type Handler = (req: Req, res: Response) => Promise<unknown> | unknown;
+const wrap = (fn: Handler) => (req: Request, res: Response, next: NextFunction) => {
+  Promise.resolve(fn(req as Req, res))
+    .then((data) => { if (!res.headersSent) res.json(data ?? { ok: true }); })
+    .catch(next);
+};
+
+function scopeOf(req: Req): { scope: Scope; projectId?: string } {
+  const scope = req.params.scope as Scope;
+  if (scope !== 'global' && scope !== 'project') throw new HttpError(400, 'scope must be global or project');
+  const projectId = scope === 'project' ? String(req.query.project ?? req.body?.project ?? '') : undefined;
+  if (scope === 'project' && !projectId) throw new HttpError(400, 'project query parameter required');
+  return { scope, projectId };
+}
+
+// ---------- health & auth ----------
+api.get('/health', wrap(async (): Promise<HealthInfo> => ({
+  ok: true,
+  workspaceDir: WORKSPACE_DIR,
+  appDir: APP_DIR,
+  models: MODELS,
+  auth: await auth.status(),
+})));
+
+api.get('/auth/status', wrap(() => auth.status()));
+api.post('/auth/login/start', wrap((req) => auth.startLogin(req.body?.mode === 'console' ? 'console' : 'claudeai')));
+api.post('/auth/login/code', wrap((req) => {
+  const code = String(req.body?.code ?? '').trim();
+  if (!code) throw new HttpError(400, 'Paste the code first');
+  return auth.submitCode(code);
+}));
+api.post('/auth/login/cancel', wrap(() => { auth.cancelLogin(); }));
+api.post('/auth/api-key', wrap(async (req) => { auth.saveApiKey(String(req.body?.key ?? '')); return auth.status(); }));
+api.post('/auth/logout', wrap(async () => { await auth.logout(); return auth.status(); }));
+
+// ---------- files ----------
+api.get('/files/:scope', wrap((req) => {
+  const { scope, projectId } = scopeOf(req);
+  return store.listFiles(scope, projectId);
+}));
+
+api.get('/files/:scope/content', wrap(async (req, res) => {
+  const { scope, projectId } = scopeOf(req);
+  const rel = String(req.query.path ?? '');
+  const { abs, text } = await store.readFile(scope, rel, projectId);
+  if (text !== undefined) return { path: rel, text };
+  res.sendFile(abs);
+}));
+
+api.put('/files/:scope/content', wrap(async (req) => {
+  const { scope, projectId } = scopeOf(req);
+  const { path: rel, text } = req.body as { path: string; text: string };
+  if (!rel) throw new HttpError(400, 'path required');
+  await store.writeTextFile(scope, rel, text ?? '', projectId);
+}));
+
+api.post('/files/:scope/upload', upload.array('files', 50), wrap(async (req) => {
+  const { scope, projectId } = scopeOf(req);
+  const dir = String(req.body?.dir ?? '');
+  const files = (req.files as Express.Multer.File[]) ?? [];
+  const saved: string[] = [];
+  for (const f of files) {
+    // multer decodes filenames as latin1; recover UTF-8 names (diacritics).
+    const name = Buffer.from(f.originalname, 'latin1').toString('utf8');
+    saved.push(...(await store.saveUpload(scope, dir, name, f.buffer, projectId)));
+  }
+  return { saved };
+}));
+
+api.post('/files/:scope/rename', wrap(async (req) => {
+  const { scope, projectId } = scopeOf(req);
+  const { from, to } = req.body as { from: string; to: string };
+  if (!from || !to) throw new HttpError(400, 'from and to required');
+  await store.renameFile(scope, from, to, projectId);
+}));
+
+api.delete('/files/:scope', wrap(async (req) => {
+  const { scope, projectId } = scopeOf(req);
+  await store.deleteFile(scope, String(req.query.path ?? ''), projectId);
+}));
+
+// ---------- projects (games) ----------
+api.get('/projects', wrap(() => store.listProjects()));
+api.post('/projects', wrap((req) => {
+  const name = String(req.body?.name ?? '').trim();
+  if (!name) throw new HttpError(400, 'name required');
+  return store.createProject(name, String(req.body?.description ?? ''));
+}));
+api.get('/projects/:id', wrap((req) => store.getProject(req.params.id)));
+api.patch('/projects/:id', wrap((req) => store.updateProject(req.params.id, req.body)));
+api.delete('/projects/:id', wrap((req) => store.deleteProject(req.params.id)));
+
+/** Effective modes for every file, combining project defaults and built-in defaults. */
+api.get('/projects/:id/context-defaults', wrap(async (req) => {
+  const project = await store.getProject(req.params.id);
+  const files = [...(await store.listFiles('global')), ...(await store.listFiles('project', project.id))];
+  const effective: ContextSelection = {};
+  for (const f of files) effective[fileKey(f.scope, f.path)] = store.effectiveMode(f, project.defaults);
+  return effective;
+}));
+
+// ---------- sessions (owner = project id, or _global / _app) ----------
+const KINDS: SessionKind[] = ['work', 'instructions', 'app'];
+
+api.get('/sessions/:owner', wrap((req) => store.listSessions(req.params.owner)));
+api.post('/sessions/:owner', wrap((req) => {
+  const kind = req.body?.kind as SessionKind;
+  if (!KINDS.includes(kind)) throw new HttpError(400, 'kind must be work, instructions or app');
+  return store.createSession(req.params.owner, kind, req.body ?? {});
+}));
+
+api.get('/sessions/:owner/:sid', wrap(async (req) => {
+  const { owner, sid } = req.params;
+  const session = await store.getSession(owner, sid);
+  const messages = await store.getMessages(owner, sid);
+  const current = agents.currentAssistant(sid);
+  if (current) messages.push(current);
+  return { session, messages, running: agents.isRunning(sid), pending: agents.pendingPermissions(sid) };
+}));
+
+api.patch('/sessions/:owner/:sid', wrap((req) => store.updateSession(req.params.owner, req.params.sid, req.body)));
+
+api.delete('/sessions/:owner/:sid', wrap(async (req) => {
+  agents.abort(req.params.sid);
+  await store.deleteSession(req.params.owner, req.params.sid);
+}));
+
+/** Preview of the system prompt the AI will receive. */
+api.get('/sessions/:owner/:sid/context', wrap(async (req) => {
+  const session = await store.getSession(req.params.owner, req.params.sid);
+  const ctx = await buildContext(session);
+  return { systemPrompt: ctx.systemPrompt, tokens: ctx.tokens, inline: ctx.inlineFiles.length, reference: ctx.referenceFiles.length };
+}));
+
+api.post('/sessions/:owner/:sid/messages', wrap(async (req) => {
+  const text = String(req.body?.text ?? '').trim();
+  if (!text) throw new HttpError(400, 'text required');
+  await agents.send(req.params.owner, req.params.sid, text);
+}));
+
+api.post('/sessions/:owner/:sid/abort', wrap((req) => { agents.abort(req.params.sid); }));
+
+api.post('/sessions/:owner/:sid/permissions/:rid', wrap((req) => {
+  agents.resolvePermission(req.params.sid, req.params.rid, Boolean(req.body?.allow));
+}));
+
+/** Server-sent events for one session. */
+api.get('/sessions/:owner/:sid/events', (req: Req, res) => {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  res.write(': connected\n\n');
+  const send = (ev: ServerEvent) => res.write(`data: ${JSON.stringify(ev)}\n\n`);
+  const unsubscribe = agents.subscribe(req.params.sid, send);
+  const ping = setInterval(() => res.write(': ping\n\n'), 20_000);
+  req.on('close', () => { clearInterval(ping); unsubscribe(); });
+});
+
+/** Used by scripts/dev-server.mjs: exit (to be respawned) once no AI turn is running. */
+api.post('/_restart', wrap(() => ({ deferred: agents.restartWhenIdle() })));
+
+// ---------- app guide (shown in the UI's help panel) ----------
+api.get('/app-guide', wrap(() => ({ text: fs.readFileSync(path.join(APP_DIR, 'APP_GUIDE.md'), 'utf8') })));

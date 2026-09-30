@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.env
+# Personal working data: session transcripts and saved credentials.
+workspace/projects/*/sessions/
+workspace/_sessions/
+workspace/.local/
+.DS_Store

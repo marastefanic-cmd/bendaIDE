@@ -1,0 +1,150 @@
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { GLOBAL_OWNER, APP_OWNER, type HealthInfo, type Project, type Scope, type Session, type SessionKind } from '../../shared/types';
+import { api } from './api';
+import { Nav } from './components/Nav';
+import { SetupWizard } from './components/SetupWizard';
+import { HelpModal } from './components/HelpModal';
+import { FileEditor } from './components/FileEditor';
+import { InstructionsPage } from './pages/InstructionsPage';
+import { AppPage } from './pages/AppPage';
+import { GamePage } from './pages/GamePage';
+import { SessionPage } from './pages/SessionPage';
+
+export type View =
+  | { type: 'instructions' }
+  | { type: 'app' }
+  | { type: 'game'; id: string }
+  | { type: 'session'; owner: string; id: string }
+  | { type: 'file'; scope: Scope; path: string; projectId?: string; back: View };
+
+export interface Shell {
+  projects: Project[];
+  health: HealthInfo | null;
+  go: (v: View) => void;
+  report: (e: unknown) => void;
+  refreshProjects: () => Promise<Project[]>;
+  openSession: (owner: string, kind: SessionKind) => Promise<void>;
+  openSetup: () => void;
+  refreshHealth: () => Promise<void>;
+}
+
+const VIEW_KEY = 'view';
+
+function loadView(): View {
+  try {
+    const v = JSON.parse(localStorage.getItem(VIEW_KEY) ?? '') as View;
+    if (v && v.type !== 'file') return v;
+  } catch { /* first run */ }
+  return { type: 'instructions' };
+}
+
+export function App() {
+  const [health, setHealth] = useState<HealthInfo | null>(null);
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [view, setView] = useState<View>(loadView);
+  const [showSetup, setShowSetup] = useState(false);
+  const [setupDismissed, setSetupDismissed] = useState(() => localStorage.getItem('setupDismissed') === '1');
+  const [showHelp, setShowHelp] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const report = useCallback((err: unknown) => setError(err instanceof Error ? err.message : String(err)), []);
+
+  const refreshHealth = useCallback(async () => {
+    try { setHealth(await api.health()); } catch (e) { report(e); }
+  }, [report]);
+
+  const refreshProjects = useCallback(async () => {
+    const list = await api.listProjects();
+    setProjects(list);
+    return list;
+  }, []);
+
+  useEffect(() => {
+    void refreshHealth();
+    refreshProjects().catch(report);
+  }, [refreshHealth, refreshProjects, report]);
+
+  useEffect(() => {
+    if (view.type !== 'file') localStorage.setItem(VIEW_KEY, JSON.stringify(view));
+  }, [view]);
+
+  // If a game was deleted elsewhere, fall back.
+  useEffect(() => {
+    if (view.type === 'game' && projects.length && !projects.some((p) => p.id === view.id)) setView({ type: 'instructions' });
+  }, [projects, view]);
+
+  const go = useCallback((v: View) => { setView(v); window.scrollTo(0, 0); }, []);
+
+  const openSession = useCallback(async (owner: string, kind: SessionKind) => {
+    try {
+      const s: Session = await api.createSession(owner, kind);
+      go({ type: 'session', owner, id: s.id });
+    } catch (e) { report(e); }
+  }, [go, report]);
+
+  const openSetup = useCallback(() => setShowSetup(true), []);
+  const shell: Shell = useMemo(() => ({
+    projects, health, go, report, refreshProjects, openSession, openSetup, refreshHealth,
+  }), [projects, health, go, report, refreshProjects, openSession, openSetup, refreshHealth]);
+
+  const needsSetup = health !== null && !health.auth.connected && !setupDismissed;
+
+  let page;
+  switch (view.type) {
+    case 'instructions': page = <InstructionsPage shell={shell} />; break;
+    case 'app': page = <AppPage shell={shell} onHelp={() => setShowHelp(true)} />; break;
+    case 'game': {
+      const project = projects.find((p) => p.id === view.id);
+      page = project ? <GamePage key={project.id} shell={shell} project={project} /> : <div className="page"><p className="muted">Loading…</p></div>;
+      break;
+    }
+    case 'session': page = <SessionPage key={view.id} shell={shell} owner={view.owner} sessionId={view.id} />; break;
+    case 'file':
+      page = (
+        <FileEditor
+          key={`${view.scope}:${view.path}`}
+          file={{ scope: view.scope, path: view.path }}
+          projectId={view.projectId}
+          onClose={() => go(view.back)}
+          onError={report}
+        />
+      );
+      break;
+  }
+
+  return (
+    <div className="app">
+      <Nav
+        projects={projects}
+        view={view}
+        health={health}
+        onGo={go}
+        onNewGame={async (name) => {
+          try { const p = await api.createProject(name); await refreshProjects(); go({ type: 'game', id: p.id }); } catch (e) { report(e); }
+        }}
+        onConnect={() => setShowSetup(true)}
+        onHelp={() => setShowHelp(true)}
+      />
+      <main className="main">
+        {error && (
+          <div className="banner error row">
+            <span className="grow">{error}</span>
+            <button className="icon-btn" onClick={() => setError(null)}>✕</button>
+          </div>
+        )}
+        {page}
+      </main>
+
+      {(showSetup || needsSetup) && (
+        <SetupWizard
+          auth={health?.auth ?? null}
+          onDone={async () => { setShowSetup(false); await refreshHealth(); }}
+          onSkip={() => { setShowSetup(false); setSetupDismissed(true); localStorage.setItem('setupDismissed', '1'); }}
+        />
+      )}
+      {showHelp && <HelpModal onClose={() => setShowHelp(false)} />}
+    </div>
+  );
+}
+
+export const OWNERS = { global: GLOBAL_OWNER, app: APP_OWNER };
